@@ -1,0 +1,8 @@
+/target
+/smoketest_out
+tests/testdata/*.db-wal
+tests/testdata/*.db-shm
+
+# Internal LevelBlue CI, not relevant to a public build
+/.gitlab-ci.yml
+/.world/

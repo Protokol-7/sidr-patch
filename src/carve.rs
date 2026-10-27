@@ -1,0 +1,900 @@
+//! Recovery of historical (older, removed and deleted) property values from a
+//! Windows 11 Windows Search SQLite database (Windows.db) and its write-ahead log.
+//!
+//! Normal SQLite reads (and therefore SIDR's regular reports) only show the newest
+//! committed version of every record. Older versions survive physically in:
+//!   * WAL frames that were later superseded by newer frames,
+//!   * WAL frames that were never committed (the last, interrupted write),
+//!   * frames left over from earlier WAL cycles (old "salt" generation),
+//!   * database pages that the WAL replaces, and unused database pages.
+//!
+//! This module reads those page images directly, decodes every
+//! SystemIndex_1_PropertyStore record (WorkId, ColumnId, Value) it can find, and
+//! reports each value that differs from the current state. Nothing is written
+//! to the input files: they are opened read-only and parsed byte by byte.
+
+use simple_error::SimpleError;
+use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs::File;
+use std::hash::{Hash, Hasher};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use crate::report::ReportProducer;
+use crate::utils::*;
+
+macro_rules! map_err(($result:expr) => ($result.map_err(|e| SimpleError::new(format!("{}", e)))));
+
+const PROPERTY_STORE: &str = "SystemIndex_1_PropertyStore";
+const MAX_PAYLOAD: u64 = 64 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Values
+
+#[derive(Clone, Debug)]
+pub enum CVal {
+    Int(i64),
+    Float(f64),
+    Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
+impl CVal {
+    fn digest(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        match self {
+            CVal::Int(i) => {
+                0u8.hash(&mut h);
+                i.hash(&mut h)
+            }
+            CVal::Float(f) => {
+                1u8.hash(&mut h);
+                f.to_bits().hash(&mut h)
+            }
+            CVal::Text(b) => {
+                2u8.hash(&mut h);
+                b.hash(&mut h)
+            }
+            CVal::Blob(b) => {
+                3u8.hash(&mut h);
+                b.hash(&mut h)
+            }
+        }
+        h.finish()
+    }
+}
+
+/// Read column `idx` of the current row as a CVal, respecting its storage class.
+fn read_cval(s: &sqlite::Statement, idx: usize) -> Option<CVal> {
+    match s.column_type(idx).ok()? {
+        sqlite::Type::Integer => s.read::<i64, _>(idx).ok().map(CVal::Int),
+        sqlite::Type::Float => s.read::<f64, _>(idx).ok().map(CVal::Float),
+        sqlite::Type::String => s.read::<Vec<u8>, _>(idx).ok().map(CVal::Text),
+        sqlite::Type::Binary => s.read::<Vec<u8>, _>(idx).ok().map(CVal::Blob),
+        sqlite::Type::Null => None,
+    }
+}
+
+fn is_date_property(name: &str) -> bool {
+    name.contains("Date") || name.contains("Time")
+}
+
+/// Render a value the same way SIDR's regular reports do (storage types 11 and 12),
+/// with sensible fallbacks for everything else.
+pub fn render_value(v: &CVal, name: &str, storage_type: i64) -> String {
+    let filetime = |n: u64| format_date_time(get_date_time_from_filetime(n));
+    match (storage_type, v) {
+        (12, CVal::Int(n)) => {
+            if is_date_property(name) {
+                filetime(*n as u64)
+            } else {
+                n.to_string()
+            }
+        }
+        (12, CVal::Blob(b)) => match le_bytes_to_u64(b) {
+            Some(n) if is_date_property(name) && b.len() == 8 => filetime(n),
+            Some(n) if !is_date_property(name) => n.to_string(),
+            _ => bytes_to_hex(b),
+        },
+        (_, CVal::Int(n)) => n.to_string(),
+        (_, CVal::Float(f)) => f.to_string(),
+        (_, CVal::Text(b)) => String::from_utf8_lossy(b).into_owned(),
+        (11, CVal::Blob(b)) => String::from_utf8_lossy(b).into_owned(),
+        (_, CVal::Blob(b)) => bytes_to_hex(b),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Where a page image came from
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Source {
+    WalOldGeneration,
+    DbReplacedByWal,
+    DbUnusedPage,
+    WalCommitted,
+    WalBadChecksum,
+    WalUncommitted,
+}
+
+impl Source {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Source::WalOldGeneration => "WAL old generation",
+            Source::DbReplacedByWal => "DB page replaced by WAL",
+            Source::DbUnusedPage => "DB unused page",
+            Source::WalCommitted => "WAL committed",
+            Source::WalBadChecksum => "WAL invalid checksum",
+            Source::WalUncommitted => "WAL uncommitted",
+        }
+    }
+    /// Approximate age rank used to order FirstSeen / LastSeen (lower = older).
+    fn age_rank(&self) -> u8 {
+        match self {
+            Source::WalOldGeneration => 0,
+            Source::DbReplacedByWal | Source::DbUnusedPage => 1,
+            Source::WalCommitted => 2,
+            Source::WalBadChecksum | Source::WalUncommitted => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Ctx {
+    Db,
+    Wal { group: usize, max_idx: usize },
+}
+
+struct Frame {
+    pgno: u32,
+    offset: u64, // file offset of the page data
+    source: Source,
+    group: usize,
+    txn: u32,
+    ctx_end: usize,
+    salt1: u32,
+}
+
+pub struct WalStats {
+    pub committed: usize,
+    pub uncommitted: usize,
+    pub old: usize,
+    pub bad: usize,
+    pub note: Option<String>,
+}
+
+fn be16(b: &[u8], o: usize) -> usize {
+    ((b[o] as usize) << 8) | b[o + 1] as usize
+}
+fn be32(b: &[u8], o: usize) -> u32 {
+    u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+
+fn wal_checksum(data: &[u8], big_endian: bool, s: (u32, u32)) -> (u32, u32) {
+    let (mut s0, mut s1) = s;
+    let word = |o: usize| {
+        let a = [data[o], data[o + 1], data[o + 2], data[o + 3]];
+        if big_endian {
+            u32::from_be_bytes(a)
+        } else {
+            u32::from_le_bytes(a)
+        }
+    };
+    let mut i = 0;
+    while i + 8 <= data.len() {
+        s0 = s0.wrapping_add(word(i)).wrapping_add(s1);
+        s1 = s1.wrapping_add(word(i + 4)).wrapping_add(s0);
+        i += 8;
+    }
+    (s0, s1)
+}
+
+fn read_varint(b: &[u8]) -> Option<(u64, usize)> {
+    let mut v: u64 = 0;
+    for i in 0..9 {
+        let c = *b.get(i)?;
+        if i == 8 {
+            return Some(((v << 8) | c as u64, 9));
+        }
+        v = (v << 7) | (c & 0x7f) as u64;
+        if c & 0x80 == 0 {
+            return Some((v, i + 1));
+        }
+    }
+    None
+}
+
+fn serial_size(t: u64) -> Option<usize> {
+    Some(match t {
+        0 | 8 | 9 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        5 => 6,
+        6 | 7 => 8,
+        10 | 11 => return None,
+        n if n % 2 == 0 => ((n - 12) / 2) as usize,
+        n => ((n - 13) / 2) as usize,
+    })
+}
+
+fn read_int(b: &[u8]) -> i64 {
+    let mut v: i64 = if !b.is_empty() && b[0] & 0x80 != 0 { -1 } else { 0 };
+    for &c in b {
+        v = (v << 8) | c as i64;
+    }
+    v
+}
+
+fn decode_int(t: u64, b: &[u8]) -> Option<i64> {
+    match t {
+        8 => Some(0),
+        9 => Some(1),
+        1..=6 => Some(read_int(b)),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Page access
+
+struct Pages {
+    db: RefCell<File>,
+    wal: Option<RefCell<File>>,
+    page_size: usize,
+    usable: usize,
+    db_pages: u32,
+    text_utf8: bool,
+    frames: Vec<Frame>,
+    by_group_pgno: HashMap<(usize, u32), Vec<usize>>,
+}
+
+impl Pages {
+    fn read_at(f: &RefCell<File>, off: u64, len: usize) -> Option<Vec<u8>> {
+        let mut f = f.borrow_mut();
+        f.seek(SeekFrom::Start(off)).ok()?;
+        let mut buf = vec![0u8; len];
+        f.read_exact(&mut buf).ok()?;
+        Some(buf)
+    }
+
+    fn db_page(&self, pgno: u32) -> Option<Vec<u8>> {
+        if pgno == 0 || pgno > self.db_pages {
+            return None;
+        }
+        Self::read_at(&self.db, (pgno as u64 - 1) * self.page_size as u64, self.page_size)
+    }
+
+    fn wal_page(&self, idx: usize) -> Option<Vec<u8>> {
+        let fr = self.frames.get(idx)?;
+        Self::read_at(self.wal.as_ref()?, fr.offset, self.page_size)
+    }
+
+    /// The image of page `pgno` as it was at the point described by `ctx`.
+    fn resolve(&self, pgno: u32, ctx: Ctx) -> Option<Vec<u8>> {
+        if let Ctx::Wal { group, max_idx } = ctx {
+            if let Some(list) = self.by_group_pgno.get(&(group, pgno)) {
+                let k = list.partition_point(|&i| i <= max_idx);
+                if k > 0 {
+                    return self.wal_page(list[k - 1]);
+                }
+            }
+        }
+        self.db_page(pgno)
+    }
+
+    fn load_wal(&mut self, wal_path: &Path) -> Result<WalStats, SimpleError> {
+        let mut stats = WalStats { committed: 0, uncommitted: 0, old: 0, bad: 0, note: None };
+        let mut f = match File::open(wal_path) {
+            Ok(f) => f,
+            Err(_) => {
+                stats.note = Some("no -wal file found".into());
+                return Ok(stats);
+            }
+        };
+        let len = map_err!(f.metadata())?.len();
+        if len < 32 {
+            stats.note = Some("-wal file is empty".into());
+            return Ok(stats);
+        }
+        let mut hdr = [0u8; 32];
+        map_err!(f.read_exact(&mut hdr))?;
+        let magic = be32(&hdr, 0);
+        if magic != 0x377f0682 && magic != 0x377f0683 {
+            stats.note = Some("-wal file has no valid WAL header".into());
+            return Ok(stats);
+        }
+        let big_endian = magic & 1 == 1;
+        let psz = be32(&hdr, 8) as usize;
+        if psz != self.page_size {
+            stats.note = Some(format!(
+                "-wal page size {} differs from database page size {}; WAL skipped",
+                psz, self.page_size
+            ));
+            return Ok(stats);
+        }
+        let salts = (be32(&hdr, 16), be32(&hdr, 20));
+        let hdr_ck = wal_checksum(&hdr[..24], big_endian, (0, 0));
+        let mut chain_ok = hdr_ck == (be32(&hdr, 24), be32(&hdr, 28));
+        let mut ck = hdr_ck;
+
+        let frame_size = 24 + psz;
+        let n = ((len - 32) / frame_size as u64) as usize;
+        let mut buf = vec![0u8; frame_size];
+        let mut raw: Vec<(u32, u32, (u32, u32), u64, bool)> = Vec::with_capacity(n);
+        let mut current_prefix = 0usize;
+        for i in 0..n {
+            let off = 32 + (i * frame_size) as u64;
+            map_err!(f.seek(SeekFrom::Start(off)))?;
+            if f.read_exact(&mut buf).is_err() {
+                break;
+            }
+            let pgno = be32(&buf, 0);
+            let commit = be32(&buf, 4);
+            let salt = (be32(&buf, 8), be32(&buf, 12));
+            let mut valid = false;
+            if chain_ok && salt == salts && pgno != 0 {
+                let c = wal_checksum(&buf[..8], big_endian, ck);
+                let c = wal_checksum(&buf[24..], big_endian, c);
+                if c == (be32(&buf, 16), be32(&buf, 20)) {
+                    ck = c;
+                    valid = true;
+                    current_prefix = i + 1;
+                } else {
+                    chain_ok = false;
+                }
+            } else {
+                chain_ok = false;
+            }
+            raw.push((pgno, commit, salt, off + 24, valid));
+        }
+
+        let last_commit = raw[..current_prefix].iter().rposition(|r| r.1 != 0);
+        // The current WAL generation is the checksum-valid prefix plus the frames that
+        // directly follow it and still belong to the same (uncommitted) transaction:
+        // frames with the header salts but a stale checksum, and frames whose salt and
+        // checksum fields are still zero. SQLite writes the latter once a transaction
+        // has overwritten one of its own uncommitted frames and only fills them in at
+        // commit time.
+        let hdr_ok = hdr_ck == (be32(&hdr, 24), be32(&hdr, 28));
+        let mut region_end = current_prefix;
+        if hdr_ok {
+            while region_end < raw.len()
+                && raw[region_end].0 != 0
+                && (raw[region_end].2 == salts || raw[region_end].2 == (0, 0))
+            {
+                region_end += 1;
+            }
+        }
+        // groups: 0 = current generation; then runs of equal salts
+        let mut groups: Vec<(usize, usize)> = Vec::new(); // [start, end)
+        if region_end > 0 {
+            groups.push((0, region_end));
+        }
+        let mut i = region_end;
+        while i < raw.len() {
+            let s = raw[i].2;
+            let start = i;
+            while i < raw.len() && raw[i].2 == s {
+                i += 1;
+            }
+            groups.push((start, i));
+        }
+
+        let mut frames: Vec<Frame> = Vec::with_capacity(raw.len());
+        for (gid, &(start, end)) in groups.iter().enumerate() {
+            // ctx_end: next commit frame at/after i within the group
+            let mut ends = vec![end - 1; end - start];
+            let mut next = end - 1;
+            for j in (start..end).rev() {
+                if raw[j].1 != 0 {
+                    next = j;
+                }
+                ends[j - start] = next;
+            }
+            let mut txn = 1u32;
+            for j in start..end {
+                let (pgno, commit, salt, offset, _) = raw[j];
+                let source = if gid == 0 && region_end > 0 {
+                    match last_commit {
+                        Some(lc) if j <= lc => Source::WalCommitted,
+                        _ => Source::WalUncommitted,
+                    }
+                } else if salt == salts {
+                    Source::WalBadChecksum
+                } else {
+                    Source::WalOldGeneration
+                };
+                match source {
+                    Source::WalCommitted => stats.committed += 1,
+                    Source::WalUncommitted => stats.uncommitted += 1,
+                    Source::WalOldGeneration => stats.old += 1,
+                    _ => stats.bad += 1,
+                }
+                frames.push(Frame {
+                    pgno,
+                    offset,
+                    source,
+                    group: gid,
+                    txn,
+                    ctx_end: ends[j - start],
+                    salt1: salt.0,
+                });
+                if commit != 0 {
+                    txn += 1;
+                }
+            }
+        }
+        for (idx, fr) in frames.iter().enumerate() {
+            if fr.pgno != 0 {
+                self.by_group_pgno.entry((fr.group, fr.pgno)).or_default().push(idx);
+            }
+        }
+        self.frames = frames;
+        self.wal = Some(RefCell::new(f));
+        Ok(stats)
+    }
+
+    /// Decode all (WorkId, ColumnId, Value) records stored on an index b-tree page.
+    fn carve_page(&self, page: &[u8], pgno: u32, ctx: Ctx, out: &mut dyn FnMut(i64, i64, CVal)) {
+        let u = self.usable;
+        if page.len() < u {
+            return;
+        }
+        let h = if pgno == 1 { 100 } else { 0 };
+        let kind = page[h];
+        if kind != 0x02 && kind != 0x0A {
+            return;
+        }
+        let hdr_len = if kind == 0x02 { 12 } else { 8 };
+        let ncells = be16(page, h + 3);
+        let ptrs = h + hdr_len;
+        if ptrs + 2 * ncells > u {
+            return;
+        }
+        let max_local = ((u - 12) * 64 / 255) - 23;
+        let min_local = ((u - 12) * 32 / 255) - 23;
+        for c in 0..ncells {
+            let mut p = be16(page, ptrs + 2 * c);
+            if p < ptrs + 2 * ncells || p >= u {
+                continue;
+            }
+            if kind == 0x02 {
+                p += 4;
+            }
+            let (plen, n) = match read_varint(&page[p.min(u)..u]) {
+                Some(x) => x,
+                None => continue,
+            };
+            if plen == 0 || plen > MAX_PAYLOAD {
+                continue;
+            }
+            p += n;
+            let plen = plen as usize;
+            let local = if plen <= max_local {
+                plen
+            } else {
+                let k = min_local + ((plen - min_local) % (u - 4));
+                if k <= max_local {
+                    k
+                } else {
+                    min_local
+                }
+            };
+            if p + local > u || (local < plen && p + local + 4 > u) {
+                continue;
+            }
+            let mut payload = page[p..p + local].to_vec();
+            if local < plen {
+                let mut ovfl = be32(page, p + local);
+                let mut seen = HashSet::new();
+                while payload.len() < plen {
+                    if ovfl == 0 || !seen.insert(ovfl) {
+                        break;
+                    }
+                    let op = match self.resolve(ovfl, ctx) {
+                        Some(op) => op,
+                        None => break,
+                    };
+                    let take = (u - 4).min(plen - payload.len());
+                    payload.extend_from_slice(&op[4..4 + take]);
+                    ovfl = be32(&op, 0);
+                }
+                if payload.len() < plen {
+                    continue;
+                }
+            }
+            if let Some((w, col, v)) = self.parse_record(&payload) {
+                out(w, col, v);
+            }
+        }
+    }
+
+    fn parse_record(&self, payload: &[u8]) -> Option<(i64, i64, CVal)> {
+        let (hsize, n) = read_varint(payload)?;
+        let hsize = hsize as usize;
+        if hsize < n + 3 || hsize > payload.len() {
+            return None;
+        }
+        let mut types = Vec::with_capacity(3);
+        let mut p = n;
+        while p < hsize {
+            let (t, k) = read_varint(&payload[p..hsize])?;
+            types.push(t);
+            p += k;
+            if types.len() > 3 {
+                return None;
+            }
+        }
+        if types.len() != 3 || p != hsize {
+            return None;
+        }
+        let sizes: Vec<usize> = types.iter().map(|&t| serial_size(t)).collect::<Option<_>>()?;
+        if hsize + sizes.iter().sum::<usize>() != payload.len() {
+            return None;
+        }
+        let b0 = &payload[hsize..hsize + sizes[0]];
+        let b1 = &payload[hsize + sizes[0]..hsize + sizes[0] + sizes[1]];
+        let b2 = &payload[hsize + sizes[0] + sizes[1]..];
+        let w = decode_int(types[0], b0)?;
+        let col = decode_int(types[1], b1)?;
+        let v = match types[2] {
+            0 => return None,
+            7 => CVal::Float(f64::from_bits(read_int(b2) as u64)),
+            t if t <= 9 => CVal::Int(decode_int(t, b2)?),
+            t if t % 2 == 0 => CVal::Blob(b2.to_vec()),
+            _ => {
+                if self.text_utf8 {
+                    CVal::Text(b2.to_vec())
+                } else {
+                    CVal::Text(from_utf16(b2).into_bytes())
+                }
+            }
+        };
+        Some((w, col, v))
+    }
+
+    /// Collect every b-tree page reachable from `root` in the view given by `ctx`.
+    fn tree_pages(&self, root: u32, ctx: Ctx, out: &mut HashSet<u32>) {
+        let u = self.usable;
+        let mut stack = vec![root];
+        while let Some(p) = stack.pop() {
+            if p == 0 || !out.insert(p) {
+                continue;
+            }
+            let page = match self.resolve(p, ctx) {
+                Some(x) if x.len() >= u => x,
+                _ => continue,
+            };
+            let h = if p == 1 { 100 } else { 0 };
+            let kind = page[h];
+            if kind != 0x02 && kind != 0x05 {
+                continue;
+            }
+            let n = be16(&page, h + 3);
+            if h + 12 + 2 * n > u {
+                continue;
+            }
+            for i in 0..n {
+                let off = be16(&page, h + 12 + 2 * i);
+                if off + 4 <= u {
+                    stack.push(be32(&page, off));
+                }
+            }
+            stack.push(be32(&page, h + 8));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Report
+
+struct Hist {
+    w: i64,
+    col: i64,
+    val: CVal,
+    sources: BTreeSet<Source>,
+    first: ((u8, usize), String),
+    last: ((u8, usize), String),
+    count: u32,
+    internal: bool,
+}
+
+pub fn write_history_report(
+    f: &Path,
+    c: &sqlite::Connection,
+    id_to_prop: &HashMap<i64, (String, i64)>,
+    report_prod: &ReportProducer,
+    hostname: &str,
+    status_logger: &mut Box<dyn Write>,
+) -> Result<(), SimpleError> {
+    // --- database header
+    let mut db = map_err!(File::open(f))?;
+    let mut hdr = [0u8; 100];
+    map_err!(db.read_exact(&mut hdr))?;
+    if &hdr[..16] != b"SQLite format 3\0" {
+        return Err(SimpleError::new("not a SQLite database"));
+    }
+    let page_size = match be16(&hdr, 16) {
+        1 => 65536,
+        n => n,
+    };
+    let usable = page_size - hdr[20] as usize;
+    let text_utf8 = be32(&hdr, 56) <= 1;
+    let db_len = map_err!(db.metadata())?.len();
+    let mut pages = Pages {
+        db: RefCell::new(db),
+        wal: None,
+        page_size,
+        usable,
+        db_pages: (db_len / page_size as u64) as u32,
+        text_utf8,
+        frames: Vec::new(),
+        by_group_pgno: HashMap::new(),
+    };
+    let mut wal_path = f.as_os_str().to_owned();
+    wal_path.push("-wal");
+    let wal_stats = pages.load_wal(&PathBuf::from(wal_path))?;
+
+    // --- current state: (WorkId, ColumnId) -> digest of current value
+    let mut current: HashMap<(i64, i64), u64> = HashMap::new();
+    let mut current_wids: HashSet<i64> = HashSet::new();
+    {
+        let mut s = map_err!(c.prepare(format!(
+            "select WorkId, ColumnId, Value from {PROPERTY_STORE}"
+        )))?;
+        while let Ok(sqlite::State::Row) = s.next() {
+            let w = map_err!(s.read::<i64, _>(0))?;
+            let col = map_err!(s.read::<i64, _>(1))?;
+            if let Some(v) = read_cval(&s, 2) {
+                current.insert((w, col), v.digest());
+                current_wids.insert(w);
+            }
+        }
+    }
+
+    // --- carve every page image we have
+    let replaced: HashSet<u32> = pages
+        .frames
+        .iter()
+        .filter(|fr| fr.source == Source::WalCommitted)
+        .map(|fr| fr.pgno)
+        .collect();
+
+    // Pages that currently belong to other tables or indexes. Some of them (e.g.
+    // SystemIndex_1_Properties) store records with the same (int, int, value) shape
+    // as the property store, so they must not be mistaken for property records.
+    let final_ctx = match pages.frames.iter().rposition(|fr| fr.source == Source::WalCommitted) {
+        Some(last) => Ctx::Wal { group: 0, max_idx: last },
+        None => Ctx::Db,
+    };
+    let mut other_live: HashSet<u32> = HashSet::new();
+    {
+        let mut s = map_err!(c.prepare(
+            "select name, rootpage from sqlite_master where rootpage > 0"
+        ))?;
+        while let Ok(sqlite::State::Row) = s.next() {
+            let name = s.read::<String, _>(0).unwrap_or_default();
+            let root = s.read::<i64, _>(1).unwrap_or(0);
+            if name != PROPERTY_STORE && root > 0 && root <= u32::MAX as i64 {
+                pages.tree_pages(root as u32, final_ctx, &mut other_live);
+            }
+        }
+    }
+    // Old copies of SystemIndex_1_Properties pages left on freed pages have the same
+    // record shape. That table's keys are (IndexID, PropertyID) with only a handful of
+    // PropertyID values, while a property-store page holds many different ColumnIds.
+    // A page is attributed to that table only if (1) every record uses one of those
+    // PropertyID values, (2) every value is a blob, and (3) at least one record is a
+    // blob under a key that is never a blob in the property store (key 0, which is not
+    // a property, or a text-type property such as System.Contact.HomeAddressCity).
+    // Such records are not dropped: they are reported separately and clearly labelled.
+    let mut prop_table_keys: HashSet<i64> = [0, 1, 100, 200, 201, 202, 203, 204, 301].into_iter().collect();
+    if let Ok(mut s) = c.prepare("select distinct PropertyID from SystemIndex_1_Properties") {
+        while let Ok(sqlite::State::Row) = s.next() {
+            if let Ok(k) = s.read::<i64, _>(0) {
+                prop_table_keys.insert(k);
+            }
+        }
+    }
+    let text_only = |col: &i64| *col == 0 || id_to_prop.get(col).map_or(false, |p| p.1 == 11);
+    let looks_like_properties_table = |cells: &[(i64, i64, CVal)]| {
+        !cells.is_empty()
+            && cells.iter().all(|(_, col, v)| prop_table_keys.contains(col) && matches!(v, CVal::Blob(_)))
+            && cells.iter().any(|(_, col, _)| text_only(col))
+    };
+    let mut skipped_pages = 0usize;
+
+    let mut hist: HashMap<(i64, i64, u64, bool), Hist> = HashMap::new();
+    let mut add = |w: i64, col: i64, v: CVal, src: Source, order: (u8, usize), loc: &dyn Fn() -> String, internal: bool| {
+        if !internal && (w <= 0 || w > u32::MAX as i64 || !id_to_prop.contains_key(&col)) {
+            return;
+        }
+        let d = v.digest();
+        if !internal && current.get(&(w, col)) == Some(&d) {
+            return;
+        }
+        let e = hist.entry((w, col, d, internal)).or_insert_with(|| Hist {
+            w,
+            col,
+            val: v,
+            sources: BTreeSet::new(),
+            first: (order, loc()),
+            last: (order, loc()),
+            count: 0,
+            internal,
+        });
+        e.sources.insert(src);
+        e.count += 1;
+        if order < e.first.0 {
+            e.first = (order, loc());
+        }
+        if order > e.last.0 {
+            e.last = (order, loc());
+        }
+    };
+
+    for pgno in 1..=pages.db_pages {
+        if other_live.contains(&pgno) {
+            continue;
+        }
+        if let Some(page) = pages.db_page(pgno) {
+            let src = if replaced.contains(&pgno) {
+                Source::DbReplacedByWal
+            } else {
+                Source::DbUnusedPage
+            };
+            let order = (src.age_rank(), pgno as usize);
+            let mut cells = Vec::new();
+            pages.carve_page(&page, pgno, Ctx::Db, &mut |w, col, v| cells.push((w, col, v)));
+            let internal = looks_like_properties_table(&cells);
+            skipped_pages += internal as usize;
+            for (w, col, v) in cells {
+                add(w, col, v, src, order, &|| format!("DB page {pgno}"), internal);
+            }
+        }
+    }
+    for (idx, fr) in pages.frames.iter().enumerate() {
+        if fr.pgno == 0 || other_live.contains(&fr.pgno) {
+            continue;
+        }
+        if let Some(page) = pages.wal_page(idx) {
+            let ctx = Ctx::Wal { group: fr.group, max_idx: fr.ctx_end };
+            let order = (fr.source.age_rank(), idx);
+            let loc = || match fr.source {
+                Source::WalCommitted => format!("WAL frame {} (transaction {})", idx + 1, fr.txn),
+                Source::WalUncommitted => format!("WAL frame {} (uncommitted)", idx + 1),
+                Source::WalOldGeneration => {
+                    format!("WAL frame {} (old generation, salt {:08x})", idx + 1, fr.salt1)
+                }
+                _ => format!("WAL frame {} (invalid checksum)", idx + 1),
+            };
+            let mut cells = Vec::new();
+            pages.carve_page(&page, fr.pgno, ctx, &mut |w, col, v| cells.push((w, col, v)));
+            let internal = looks_like_properties_table(&cells);
+            skipped_pages += internal as usize;
+            for (w, col, v) in cells {
+                add(w, col, v, fr.source, order, &loc, internal);
+            }
+        }
+    }
+
+    // --- context: item path per WorkId (current, or historical for deleted items)
+    let path_cols: Vec<i64> = ["System.ItemPathDisplay", "System.ItemUrl", "System.ItemNameDisplay"]
+        .iter()
+        .filter_map(|n| id_to_prop.iter().find(|(_, (name, _))| name == n).map(|(id, _)| *id))
+        .collect();
+    let mut hist_paths: HashMap<i64, String> = HashMap::new();
+    for pc in &path_cols {
+        for h in hist.values() {
+            if !h.internal && h.col == *pc && !current_wids.contains(&h.w) {
+                hist_paths
+                    .entry(h.w)
+                    .or_insert_with(|| render_value(&h.val, "", 11));
+            }
+        }
+    }
+
+    let mut rows: Vec<&Hist> = hist.values().collect();
+    rows.sort_by(|a, b| (a.internal, a.w, a.col, &a.first.0).cmp(&(b.internal, b.w, b.col, &b.first.0)));
+    let file_rows = rows.iter().filter(|h| !h.internal).count();
+
+    let (rep_path, mut rep) = report_prod.new_report(f, hostname, "Recovered_Values_Report", None)?;
+    writeln!(status_logger, "{}", rep_path.to_string_lossy())
+        .map_err(|e| SimpleError::new(format!("{e}")))?;
+
+    let mut q = map_err!(c.prepare(format!(
+        "select Value from {PROPERTY_STORE} where WorkId = ? and ColumnId = ?"
+    )))?;
+    let mut lookup = |w: i64, col: i64| -> Option<CVal> {
+        q.reset().ok()?;
+        q.bind((1, w)).ok()?;
+        q.bind((2, col)).ok()?;
+        match q.next() {
+            Ok(sqlite::State::Row) => read_cval(&q, 0),
+            _ => None,
+        }
+    };
+
+    for h in &rows {
+        if h.internal {
+            // Not file data: an old record of the SystemIndex_1_Properties table
+            // (key = IndexID, PropertyID). Reported for completeness, never merged with
+            // file records.
+            rep.create_new_row();
+            rep.insert_str_val("WorkId", String::new());
+            rep.insert_str_val("Status", "Not file data (SystemIndex_1_Properties)".to_string());
+            rep.insert_str_val("Property", format!("IndexID {}, PropertyID {}", h.w, h.col));
+            rep.insert_str_val("HistoricalValue", render_value(&h.val, "", 0));
+            rep.insert_str_val("CurrentValue", String::new());
+            rep.insert_str_val("ItemPath", String::new());
+            rep.insert_str_val(
+                "Source",
+                h.sources.iter().map(|s| s.label()).collect::<Vec<_>>().join("; "),
+            );
+            rep.insert_str_val("FirstSeen", h.first.1.clone());
+            rep.insert_str_val("LastSeen", h.last.1.clone());
+            rep.insert_int_val("Occurrences", h.count as u64);
+            continue;
+        }
+        let (name, st) = id_to_prop.get(&h.col).cloned().unwrap_or_default();
+        let deleted = !current_wids.contains(&h.w);
+        let cur = if deleted { None } else { lookup(h.w, h.col) };
+        let status = if deleted {
+            "Record deleted"
+        } else if cur.is_some() {
+            "Changed"
+        } else {
+            "Property removed"
+        };
+        let item = if deleted {
+            hist_paths.get(&h.w).cloned().unwrap_or_default()
+        } else {
+            path_cols
+                .iter()
+                .find_map(|pc| lookup(h.w, *pc))
+                .map(|v| render_value(&v, "", 11))
+                .unwrap_or_default()
+        };
+        rep.create_new_row();
+        rep.insert_int_val("WorkId", h.w as u64);
+        rep.insert_str_val("Status", status.to_string());
+        rep.insert_str_val("Property", name.clone());
+        rep.insert_str_val("HistoricalValue", render_value(&h.val, &name, st));
+        rep.insert_str_val(
+            "CurrentValue",
+            cur.map(|v| render_value(&v, &name, st)).unwrap_or_default(),
+        );
+        rep.insert_str_val("ItemPath", item);
+        rep.insert_str_val(
+            "Source",
+            h.sources.iter().map(|s| s.label()).collect::<Vec<_>>().join("; "),
+        );
+        rep.insert_str_val("FirstSeen", h.first.1.clone());
+        rep.insert_str_val("LastSeen", h.last.1.clone());
+        rep.insert_int_val("Occurrences", h.count as u64);
+    }
+    drop(rep);
+
+    writeln!(
+        status_logger,
+        "History: {} historical file value(s) recovered, plus {} internal SystemIndex_1_Properties record(s) from {} page(s), listed separately. WAL frames: {} committed, {} uncommitted, {} old generation, {} invalid checksum{}. DB pages scanned: {}.\n",
+        file_rows,
+        rows.len() - file_rows,
+        skipped_pages,
+        wal_stats.committed,
+        wal_stats.uncommitted,
+        wal_stats.old,
+        wal_stats.bad,
+        wal_stats.note.map(|n| format!(" ({n})")).unwrap_or_default(),
+        pages.db_pages
+    )
+    .map_err(|e| SimpleError::new(format!("{e}")))?;
+    Ok(())
+}
+
+// Added for sidr-patch (2026-10-26). Licensed under the Apache License, Version 2.0,
+// like the rest of SIDR. See CHANGES-PATCH.md.
