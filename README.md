@@ -1,8 +1,8 @@
 # sidr-patch
 
-**sidr-patch** is a fork of [strozfriedberg/sidr](https://github.com/strozfriedberg/sidr) (SIDR — Search Index DB Reporter), a Rust tool that parses Windows Search artifacts (`Windows.edb` on Windows 10 and earlier, `Windows.db` on Windows 11) into File, Internet History and Activity History reports.
+**sidr-patch** is a fork of [strozfriedberg/sidr](https://github.com/strozfriedberg/sidr) (SIDR, Search Index DB Reporter), a Rust tool that parses Windows Search artifacts (`Windows.edb` on Windows 10 and earlier, `Windows.db` on Windows 11) into File, Internet History and Activity History reports.
 
-> **Most of this codebase is unmodified upstream SIDR** (base commit `5bde8e8`, Apache License 2.0, © 2025 LevelBlue). We only patched it to stop crashing on Windows 11 24H2/25H2/26H2 databases and added the new `--history` recovery option below — we didn't write SIDR itself. See [Copyright](#copyright) and the full diff in [sidr-patch.patch](sidr-patch.patch) for exactly what we changed vs. what's untouched upstream code.
+> Most of this codebase is unmodified upstream SIDR (base commit `5bde8e8`, Apache License 2.0, © 2025 LevelBlue). We only patched it to stop crashing on Windows 11 24H2/25H2/26H2 databases and added the new `--history` recovery option below. We didn't write SIDR itself. See [Copyright](#copyright) and the full diff in [sidr-patch.patch](sidr-patch.patch) for exactly what we changed vs. what's untouched upstream code.
 
 This fork fixes three crashes/decoding bugs that stock SIDR 0.9.2 hits on Windows 11 24H2/25H2 `Windows.db` databases, and adds a `--history` option that recovers older, removed and deleted property values by carving the WAL and unused database pages.
 
@@ -21,11 +21,11 @@ Builds as `sidr_patch.exe`. Full technical write-up of the changes: [CHANGES-PAT
 
 Windows Search's `Windows.db` is a SQLite database, but newer Windows 11 builds write it using features stock SIDR (and plain SQLite) can't handle:
 
-1. **Custom collations.** The database declares columns collated with `UNICODE_en-US` and similar sequences that only exist inside the Windows Search indexer itself — not in SQLite. Any query against those columns fails outright with `no such collation sequence: UNICODE_en-US`, before SIDR produces any output.
+1. **Custom collations.** The database declares columns collated with `UNICODE_en-US` and similar sequences that only exist inside the Windows Search indexer itself, not in SQLite. Any query against those columns fails outright with `no such collation sequence: UNICODE_en-US`, before SIDR produces any output.
 2. **A decoding panic on short values.** SIDR reads "storage type 12" columns (dates/numbers) as an 8-byte blob and converts it with a fixed-size `TryFromSliceError`-panicking conversion. Newer builds sometimes store these values as something other than exactly 8 raw bytes, which crashes the whole run instead of just that one field.
 3. **Storage-type-12 values stored as native integers.** Some of these same columns are stored by SQLite as native integers rather than as a blob. Stock SIDR's blob-reading path reads them back out as their decimal text representation (e.g. the literal characters `"133712345600000000"`) instead of decoding them as the date/number they represent.
 
-None of these are specific to a single feature update — they're a consequence of how the Windows Search indexer's database schema evolved from the one stock SIDR was built against. The fixes below address the root cause (the collation isn't resolved vs. SQLite's expectations) rather than special-casing a version number, so they apply the same way on 24H2, 25H2 and 26H2. The 24H2 and 25H2 fixes are validated against real databases (see below); 26H2 hasn't been separately tested but exercises the identical code paths.
+None of these are specific to a single feature update. They're a consequence of how the Windows Search indexer's database schema evolved from the one stock SIDR was built against. The fixes below address the root cause (the collation isn't resolved vs. SQLite's expectations) rather than special-casing a version number, so they apply the same way on 24H2, 25H2 and 26H2. The 24H2 and 25H2 fixes are validated against real databases (see below); 26H2 hasn't been separately tested but exercises the identical code paths.
 
 ### What was changed
 
@@ -82,7 +82,7 @@ Scans `C:\test` for `Windows.db`/`Windows.edb`, writes reports to `C:\out`:
 
 `HOSTNAME` is extracted from the database; filenames follow `HOSTNAME_ReportName_DateTime.json|csv`.
 
-To include a `Windows.db`'s write-ahead log in the scan, put `Windows.db` together with `Windows.db-wal` (and `-shm` if present) in the input folder. All input files are opened read-only and are never modified — if `-shm` is missing, SQLite may create a new one, but `Windows.db` and `-wal` stay unchanged.
+To include a `Windows.db`'s write-ahead log in the scan, put `Windows.db` together with `Windows.db-wal` (and `-shm` if present) in the input folder. All input files are opened read-only and are never modified. If `-shm` is missing, SQLite may create a new one, but `Windows.db` and `-wal` stay unchanged.
 
 ### The `--history` option
 
@@ -95,11 +95,11 @@ It reads `Windows.db` and `Windows.db-wal` directly, byte by byte, read-only, an
 - the WAL: committed frames, the uncommitted tail of the last transaction (including frames whose salt/checksum fields are still zero), and frames left over from earlier WAL cycles;
 - `Windows.db` pages that the WAL has since replaced, and unused/freed pages.
 
-It decodes index b-tree pages directly and follows overflow chains using the page versions valid at each point in the WAL — it does not rely on SQLite's own query engine for this part. Old `SystemIndex_1_Properties` records (an internal Windows Search table, not file records) are labelled `Not file data` rather than mixed in with recovered file data.
+It decodes index b-tree pages directly and follows overflow chains using the page versions valid at each point in the WAL. It does not rely on SQLite's own query engine for this part. Old `SystemIndex_1_Properties` records (an internal Windows Search table, not file records) are labelled `Not file data` rather than mixed in with recovered file data.
 
-**Columns:** `WorkId`, `Status` (`Changed` / `Property removed` / `Record deleted` / `Not file data`), `Property`, `HistoricalValue`, `CurrentValue`, `ItemPath`, `Source` (where the value was found — WAL committed/uncommitted/old generation, DB page replaced by WAL, DB unused page), `FirstSeen`/`LastSeen`, `Occurrences`. Full column semantics, limits (what can and can't be recovered), and validation results: [README-PATCH.txt](README-PATCH.txt).
+**Columns:** `WorkId`, `Status` (`Changed` / `Property removed` / `Record deleted` / `Not file data`), `Property`, `HistoricalValue`, `CurrentValue`, `ItemPath`, `Source` (where the value was found: WAL committed/uncommitted/old generation, DB page replaced by WAL, DB unused page), `FirstSeen`/`LastSeen`, `Occurrences`. Full column semantics, limits (what can and can't be recovered), and validation results: [README-PATCH.txt](README-PATCH.txt).
 
-**Caveats:** only versions that physically survive can be recovered — data overwritten by a later WAL cycle or page reuse is gone. Windows Search can reuse a WorkId for a different item, so cross-check `ItemPath` and dates before treating a `Changed` row as the same file. The WAL has no timestamps of its own, so ordering between recovered values is approximate.
+**Caveats:** only versions that physically survive can be recovered. Data overwritten by a later WAL cycle or page reuse is gone. Windows Search can reuse a WorkId for a different item, so cross-check `ItemPath` and dates before treating a `Changed` row as the same file. The WAL has no timestamps of its own, so ordering between recovered values is approximate.
 
 ### Building
 
@@ -121,7 +121,7 @@ Full build details, including the cross-compiled Linux→Windows build: [BUILD-P
 
 ### Velociraptor Plugin
 
-The `velosidr.yaml` file can be used to configure a Velociraptor plugin that will run SIDR on a target system. It's unmodified from upstream and fetches stock SIDR by default — update the `url` in the `Tools` section to point at a `sidr_patch` release if you want the plugin to use this fork.
+The `velosidr.yaml` file can be used to configure a Velociraptor plugin that will run SIDR on a target system. It's unmodified from upstream and fetches stock SIDR by default. Update the `url` in the `Tools` section to point at a `sidr_patch` release if you want the plugin to use this fork.
 
 Note: In order to parse the database on the target endpoint, the SIDR plugin must create an empty database and copy the original database to it. Creating the new copy can overwrite multiple gigabytes of data in unallocated clusters, which may result in loss of evidence. Please use the plugin with caution.
 
