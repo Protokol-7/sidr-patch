@@ -1,4 +1,5 @@
 # sidr-patch
+Link to blog: https://protokol-7.github.io/dfir/2026/10/28/windows-search-index-gaps-and-wal-carving.html
 
 **sidr-patch** is a fork of [strozfriedberg/sidr](https://github.com/strozfriedberg/sidr) (SIDR, Search Index DB Reporter), a Rust tool that parses Windows Search artifacts (`Windows.edb` on Windows 10 and earlier, `Windows.db` on Windows 11) into File, Internet History and Activity History reports.
 
