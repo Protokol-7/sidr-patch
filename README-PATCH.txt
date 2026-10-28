@@ -15,8 +15,15 @@ CHANGES FROM STOCK SIDR 0.9.2
      the tool; such values are written as hex. Values stored as native SQLite
      integers are decoded correctly.
   3. New --history option (below).
-  The File, Internet History and Activity History reports are byte-identical to
-  stock SIDR on databases stock SIDR can read (tested on SIDR's sample .edb/.db).
+  4. Fixed a CSV header bug present in stock SIDR 0.9.2: the header used to be
+     fixed to whatever properties the first processed record had, so properties
+     like System.Search.AutoSummary or System.FileOwner could be missing from
+     the header entirely if the first record in the table didn't have them.
+     Every property a report's rows can contain is now registered before any
+     row is written, so the header always covers everything that gets written.
+  The File, Internet History and Activity History reports carry the same
+  per-row data as stock SIDR, but CSV column layout is no longer byte-identical
+  because of fix 4 above (tested on SIDR's sample .edb/.db).
 
 --history: <HOST>_Recovered_Values_Report_<time>.csv
   One row per property value that exists physically in the files but differs from

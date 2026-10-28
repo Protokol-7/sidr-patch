@@ -17,6 +17,52 @@ use std::io::Write;
 const CACHE_SIZE_ENTRIES: usize = 10;
 const ESENTUTL_MSG: &str = "Use esentutl for recovery (/r) and repair (/p).\nNote that esentutl must be run from a version of Windows that is equal to or newer than the one that generated the database.";
 
+// The CSV writer (see report.rs) fixes its header to whatever fields the first row
+// written has. Every field a record might ever have must be registered with
+// Report::set_field before the first row is written, or a record that introduces a
+// field the first one didn't have ends up as an unlabelled, column-misaligned
+// trailing value instead of a named column.
+const FILE_REPORT_FIELDS: &[&str] = &[
+    "WorkId",
+    "System_ItemPathDisplay",
+    "System_DateModified",
+    "System_DateCreated",
+    "System_DateAccessed",
+    "System_Size",
+    "System_FileOwner",
+    "System_Search_AutoSummary",
+    "System_Search_GatherTime",
+    "System_ItemType",
+    "System_ComputerName",
+];
+
+const IE_HISTORY_FIELDS: &[&str] = &[
+    "WorkId",
+    "System_DateModified",
+    "System_ItemUrl",
+    "System_Link_TargetUrl",
+    "System_ItemDate",
+    "System_Search_GatherTime",
+    "System_Title",
+    "System_Link_DateVisited",
+    "System_ComputerName",
+];
+
+const ACTIVITY_HISTORY_FIELDS: &[&str] = &[
+    "WorkId",
+    "System_ItemNameDisplay",
+    "System_ItemUrl",
+    "System_ActivityHistory_StartTime",
+    "System_ActivityHistory_EndTime",
+    "System_Activity_AppDisplayName",
+    "System_ActivityHistory_AppId",
+    "System_Activity_DisplayText",
+    "VolumeId",
+    "ObjectId",
+    "System_Activity_ContentUri",
+    "System_ComputerName",
+];
+
 fn prepare_selected_cols(cols: Vec<ColumnInfo>, sel_cols: &Vec<&str>) -> Vec<ColumnInfo> {
     let mut only_cols: Vec<ColumnInfo> = Vec::new();
     for c in cols {
@@ -171,6 +217,16 @@ pub fn ese_generate_report(
         status_logger,
         Some(edb_database_state),
     )?;
+
+    for field in FILE_REPORT_FIELDS {
+        file_rep.set_field(field);
+    }
+    for field in IE_HISTORY_FIELDS {
+        ie_rep.set_field(field);
+    }
+    for field in ACTIVITY_HISTORY_FIELDS {
+        act_rep.set_field(field);
+    }
 
     let mut h = HashMap::new();
     loop {
@@ -378,3 +434,8 @@ fn ese_activity_history_record(
     }
     true
 }
+
+// Modified for sidr-patch (2026-10-28): Registers every field a report's rows can
+// contain (Report::set_field) before the main loop, so the CSV header covers them
+// all instead of whatever the first processed record happened to have.
+// See CHANGES-PATCH.md. Original: https://github.com/strozfriedberg/sidr v0.9.2

@@ -34,8 +34,11 @@ None of these are specific to a single feature update. They're a consequence of 
 | `no such collation sequence: UNICODE_en-US` | Registers a case-insensitive stand-in for whatever collation SQLite asks for, via `sqlite3_collation_needed` | `src/lib.rs`, `src/sqlite.rs` |
 | Panic on storage-type-12 values that aren't exactly 8 bytes | Non-panicking decode (`le_bytes_to_u64`); values of unexpected length are written as hex instead of crashing | `src/sqlite.rs`, `src/lib.rs`, `src/utils.rs` |
 | Storage-type-12 values stored as native SQLite integers read back as decimal text | Read as integers first, then decoded the same way as the blob form | `src/sqlite.rs`, `src/lib.rs` |
+| CSV reports: header fixed to whichever properties the *first* processed record had; a property any later record introduced (e.g. `System.Search.AutoSummary`, `System.FileOwner`) was silently dropped from the header and written as an unlabelled, column-misaligned trailing value instead | Every field a report's rows can contain is registered (`Report::set_field`) before any row is written: a one-time field-collection pass on the SQLite path, a static field list on the ESE path | `src/sqlite.rs`, `src/ese.rs` |
 
-The File, Internet History and Activity History reports are byte-identical to stock SIDR 0.9.2 on databases stock SIDR can already read. Full detail, including the validation methodology, is in [CHANGES-PATCH.md](CHANGES-PATCH.md).
+This last one isn't 24H2/25H2-specific, it's present in stock SIDR v0.9.2 for any database where records don't all share an identical property set, which is normal. On the bundled sample `.edb`, the File Report header went from 7 columns to 11 once this was fixed, with no change in row count.
+
+The File, Internet History and Activity History reports carry the same per-row data as stock SIDR 0.9.2 on databases stock SIDR can already read, but column layout is no longer byte-identical because of the fix above. Full detail, including the validation methodology, is in [CHANGES-PATCH.md](CHANGES-PATCH.md).
 
 ### Usage
 

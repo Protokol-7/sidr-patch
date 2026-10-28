@@ -16,8 +16,38 @@ build, even from identical source (see BUILD-PATCH.md).
 | Panic `TryFromSliceError` in `ese_parser.rs:530` when a storage-type-12 value is not exactly 8 bytes | Non-panicking decoding (`le_bytes_to_u64`). Dates of unexpected length are written as hex | `src/sqlite.rs`, `src/lib.rs`, `src/utils.rs` |
 | Storage-type-12 values stored as native SQLite integers were read as their decimal text | Read as integers, then decoded as before | `src/sqlite.rs`, `src/lib.rs` |
 
-The File, Internet History and Activity History reports are byte-identical to v0.9.2
-on databases v0.9.2 can read (checked on SIDR's own sample `.edb` and `.db`).
+The File, Internet History and Activity History reports carry the same per-row data as
+v0.9.2 on databases v0.9.2 can read, but CSV column layout is no longer byte-identical
+(see the next section for why).
+
+## CSV header/column bug (present in stock v0.9.2, not 24H2/25H2-specific)
+
+`ReportCsv` (`src/report.rs`) fixes its CSV header to whatever fields the first row
+written to a report happens to have, via `Report::set_field`. Neither the ESE nor the
+SQLite reporting code called `set_field` before writing rows, so in practice the header
+was whatever properties the *first processed record* had. Later records that introduced
+a property the first one didn't have got appended as an extra, unlabelled, column-
+misaligned trailing value instead of a named column. On real data, `System.Size`,
+`System.FileOwner`, `System.Search.AutoSummary` and `System.ComputerName` could end up
+missing from the File Report header entirely, depending only on what the first record in
+the table happened to be (e.g. a folder, which has no `AutoSummary`).
+
+This is not specific to 24H2/25H2 or to this fork: it's present in stock SIDR v0.9.2 for
+any database where records don't all share an identical property set, which is normal.
+
+Fix: every field a report's rows can ever contain is registered with `Report::set_field`
+before any row is written.
+- ESE path (`src/ese.rs`): the column list per report is already static in the source, so
+  the fix is a fixed list of `set_field` calls right after the reports are created.
+- SQLite path (`src/sqlite.rs`): the column set is data-driven, so a field-collection
+  pass scans every record once first (classifying it the same way the write pass does)
+  to build the complete per-report field set, then `set_field` is called for each before
+  the real write pass runs.
+
+Confirmed against the bundled sample `.edb`: the File Report header went from 7 columns
+(`WorkId,System_DateModified,System_DateCreated,System_DateAccessed,System_ItemPathDisplay,System_ItemType,System_Search_GatherTime`)
+to 11 (adding `System_Size`, `System_FileOwner`, `System_Search_AutoSummary`,
+`System_ComputerName`), with the same row count before and after (981 lines).
 
 ## New option `--history` (Windows.db only)
 
